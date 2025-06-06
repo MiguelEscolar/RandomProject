@@ -5,7 +5,7 @@ def generate_prod_report(pivot_table, idx_cols, sum_cols, reject_col="Rejects", 
     # Drop SO column if it exists in index columns and dataframe
     if 'SO' in df.columns:
         df = df.drop(columns=['SO'])
-    idx_cols_no_so = [col for col in idx_cols if col != 'SO']
+    idx_cols_no_so = [col for col in idx_cols if col not in ('SO', 'Daily_Output')]
     columns = idx_cols_no_so + sum_cols + [reject_col]
 
     group_cols = ['PO', 'dEnd', 'Prod_Code', 'Quantity']
