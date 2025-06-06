@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 
 def generate_boss_report(pivot_table, so_value=None):
     group_cols = ['PO', 'Prod_Code', 'Quantity']
@@ -11,6 +12,7 @@ def generate_boss_report(pivot_table, so_value=None):
         .sum()
         .reset_index()
     )
+
     # Find earliest (min) Mold_start for date calculations
     mold_start_min = (
         pivot_table
@@ -19,14 +21,47 @@ def generate_boss_report(pivot_table, so_value=None):
         .min()
         .reset_index()
     )
-    # Add Mold_start (as the new column)
+
+    # Get Daily_Output if present in pivot_table index or columns and merge
+    if 'Daily_Output' in pivot_table.reset_index().columns:
+        daily_output = (
+            pivot_table
+            .reset_index()
+            .groupby(group_cols)['Daily_Output']
+            .first()
+            .reset_index()
+        )
+    else:
+        daily_output = None
+
     grouped = pd.merge(grouped, mold_start_min, on=group_cols, how='left')
 
-    # Calculate date columns (all as "m/d" string)
+    if daily_output is not None:
+        grouped = pd.merge(grouped, daily_output, on=group_cols, how='left')
+    else:
+        grouped['Daily_Output'] = np.nan   # fallback
+
+    # Calculate Mold_start_fmt for display
     grouped['Mold_start_fmt'] = pd.to_datetime(grouped['Mold_start'], errors='coerce').apply(
         lambda val: f"{val.month}/{val.day}" if pd.notnull(val) else ""
     )
-    grouped['Mold_end'] = pd.to_datetime(grouped['Mold_start'], errors='coerce')  # Mold End = Mold_start as datetime
+
+    # --- CUSTOM LOGIC FOR Mold_end ---
+    # Mold_end = Mold_start + ceil(Quantity / Daily_Output)
+    def compute_mold_end(row):
+        try:
+            start = pd.to_datetime(row['Mold_start'])
+            qty = row['Quantity']
+            d_output = row['Daily_Output']
+            if pd.isnull(start) or pd.isnull(qty) or pd.isnull(d_output) or d_output == 0:
+                return ""
+            days = int(np.ceil(qty / d_output))
+            end = start + pd.Timedelta(days=days)
+            return end
+        except Exception:
+            return ""
+    grouped['Mold_end'] = grouped.apply(compute_mold_end, axis=1)
+
     grouped['Subcon_target'] = grouped['Mold_end'] + pd.Timedelta(days=2)
     grouped['Receive_target'] = grouped['Subcon_target'] + pd.Timedelta(days=14)
     grouped['Count_target'] = grouped['Receive_target'] + pd.Timedelta(days=3)
@@ -35,7 +70,7 @@ def generate_boss_report(pivot_table, so_value=None):
 
     def format_md(val):
         try:
-            if pd.isnull(val):
+            if pd.isnull(val) or val == "":
                 return ""
             val = pd.to_datetime(val)
             return f"{val.month}/{val.day}"
