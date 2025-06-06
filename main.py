@@ -1,8 +1,8 @@
 import os
 import pandas as pd
 import numpy as np
-import warnings
-from datetime import date
+import warnings, code
+from datetime import date, timedelta
 from generate_prod_report import generate_prod_report
 from generate_boss_report import generate_boss_report
 
@@ -58,14 +58,96 @@ if __name__ == "__main__":
     df_orders = pd.read_excel(Plan, sheet_name="PurchaseOrder", header=1)
     df_orders = df_orders[['Sales Order No.','P/O DATE','PO#','PRODUCT CODE','P/O QTY','Target Del. Date']].dropna(subset=['Sales Order No.'])
     df_orders.columns = ['SO', 'PO_Date', 'PO', 'Prod_Code','Quantity','Delivery_Date']
-    df_orders['PO_Date'] = pd.to_datetime(df_orders['PO_Date'], errors='coerce').dt.date
-    df_orders['Delivery_Date'] = pd.to_datetime(df_orders['Delivery_Date'], errors='coerce').dt.date
+    df_orders['PO_Date'] = pd.to_datetime(df_orders['PO_Date'], errors='coerce', utc=True).dt.tz_convert('Asia/Hong_Kong').dt.date
+    df_orders['Delivery_Date'] = pd.to_datetime(df_orders['Delivery_Date'], errors='coerce', utc=True).dt.tz_convert('Asia/Hong_Kong').dt.date
 
-    df_compute = pd.read_excel(Plan, sheet_name="Computation", header=4)
-    df_compute = df_compute[['OFFICIAL PRODUCT CODE         (Use by Production)','Delivery Date','Ordered Qty.',"No. of Day's",'Target Start']].dropna(subset=['Ordered Qty.'])
-    df_compute.columns = ['Prod_Code', 'Delivery_Date', 'Quantity', 'Days', 'Target_Start']
-    df_compute['Delivery_Date'] = pd.to_datetime(df_compute['Delivery_Date'], errors='coerce').dt.date
-    df_compute['Target_Start'] = pd.to_datetime(df_compute['Target_Start'], errors='coerce').dt.date
+    # 1. Modify df_compute to fetch Daily Output and Finished Product Beg. Bal.
+    df_compute = pd.read_excel(
+        Plan,
+        sheet_name="Computation",
+        header=4
+    )
+    compute_cols = [
+        'OFFICIAL PRODUCT CODE         (Use by Production)',
+        'Delivery Date',
+        'Ordered Qty.',
+        "No. of Day's",
+        'Target Start',
+        'Daily Output',
+        'Finished Product Beg. Bal.'
+    ]
+    df_compute = df_compute[compute_cols].dropna(subset=['Ordered Qty.'])
+    df_compute.columns = [
+        'Prod_Code',
+        'Delivery_Date',
+        'Quantity',
+        'Days',
+        'Target_Start',
+        'Daily_Output',
+        'Inventory'
+    ]
+    df_compute['Delivery_Date'] = pd.to_datetime(df_compute['Delivery_Date'], errors='coerce', utc=True).dt.tz_convert('Asia/Hong_Kong').dt.date
+    df_compute['Target_Start'] = pd.to_datetime(df_compute['Target_Start'], errors='coerce', utc=True).dt.tz_convert('Asia/Hong_Kong').dt.date
+
+    # 2. Modify merge to be case-insensitive for columns Prod_Code
+    df_orders['Prod_Code_lower'] = df_orders['Prod_Code'].str.lower()
+    df_orders['Delivery_Date_str'] = df_orders['Delivery_Date'].astype(str)
+    df_orders['Quantity_str'] = df_orders['Quantity'].astype(str)
+
+    df_compute['Prod_Code_lower'] = df_compute['Prod_Code'].str.lower()
+    df_compute['Delivery_Date_str'] = df_compute['Delivery_Date'].astype(str)
+    df_compute['Quantity_str'] = df_compute['Quantity'].astype(str)
+
+    df_main = pd.merge(
+        df_orders,
+        df_compute,
+        left_on=['Prod_Code_lower', 'Delivery_Date_str', 'Quantity_str'],
+        right_on=['Prod_Code_lower', 'Delivery_Date_str', 'Quantity_str'],
+        how='left',
+        suffixes=('_order', '_compute')
+    )
+
+    # Restore original column names for downstream code
+    df_main['Prod_Code'] = df_main['Prod_Code_order']
+    df_main['Delivery_Date'] = pd.to_datetime(df_main['Delivery_Date_str']).dt.date
+    df_main['Quantity'] = pd.to_numeric(df_main['Quantity_str'], errors='coerce')
+    df_main['dStart'] = np.where(df_main['Target_Start'].notna(), df_main['Target_Start'], df_main['PO_Date'])
+    df_main['dEnd'] = df_main['Delivery_Date']
+
+    # 3. Fill Daily_Output nulls by searching df_compute by Prod_Code (case-insensitive)
+    def fill_daily_output(row, df_compute):
+        if pd.notnull(row['Daily_Output']):
+            return row['Daily_Output']
+        matches = df_compute[
+            df_compute['Prod_Code_lower'] == str(row['Prod_Code']).lower()
+        ]
+        if not matches.empty:
+            output = matches['Daily_Output'].dropna()
+            if not output.empty:
+                return output.iloc[0]
+        return np.nan
+
+    df_main['Daily_Output'] = df_main.apply(lambda row: fill_daily_output(row, df_compute), axis=1)
+
+    # Inventory column is already in df_main, as merged
+
+    # ========== Mold_End computation logic ==========
+    def compute_mold_end(row):
+        try:
+            mold_start = pd.to_datetime(row['dStart'])
+            quantity = row['Quantity']
+            daily_output = row['Daily_Output']
+            if pd.isnull(mold_start) or pd.isnull(quantity) or pd.isnull(daily_output) or daily_output == 0:
+                return pd.NaT
+            num_days = int(np.ceil(quantity / daily_output))
+            return (mold_start + pd.Timedelta(days=num_days))
+        except Exception:
+            return pd.NaT
+
+    df_main['Mold_End'] = df_main.apply(compute_mold_end, axis=1)
+
+    # ========== Store Mold_End in df_job ==========
+    df_job = df_main[['SO','PO','dStart','dEnd','Prod_Code','Quantity','Days','Daily_Output','Inventory','Mold_End']]
 
     df_movements = pd.read_excel(Lot, sheet_name="Lot Monitoring", header=2)
     df_movements = df_movements[['Part Code', 'Lot No.', 'QTY', 'Actual Date', 'Qty', 'DR Date', 'Qty Received', 'Actual Date.1', 'QTY.1', 'Actual Date.2', 'QTY.2','Actual Date.3', 'QTY.3', 'Date', 'Qty.1']].dropna(subset=['Part Code'])
@@ -79,12 +161,7 @@ if __name__ == "__main__":
         try:
             df_movements[col] = df_movements[col].dt.date
         except:
-            df_movements[col] = pd.to_datetime(df_movements[col], errors='coerce').dt.date
-
-    df_main = pd.merge(df_orders, df_compute, left_on=['Prod_Code','Delivery_Date','Quantity'], right_on=['Prod_Code','Delivery_Date','Quantity'], how='left')
-    df_main['dStart'] = np.where(df_main['Target_Start'].notna(), df_main['Target_Start'], df_main['PO_Date'])
-    df_main['dEnd'] = df_main['Delivery_Date']
-    df_job = df_main[['SO','PO','dStart','dEnd','Prod_Code','Quantity','Days']]
+            df_movements[col] = pd.to_datetime(df_movements[col], errors='coerce', utc=True).dt.tz_convert('Asia/Hong_Kong').dt.date
 
     mold_df = df_movements[['Prod_Code', 'Lot_Num', 'Mold_start', 'Mold_date','Mold_Qty']].dropna(subset=['Mold_date'])
     subcon_df = df_movements[['Prod_Code', 'Lot_Num', 'Mold_start','Subcon_Date','Subcon_Qty']].dropna(subset=['Subcon_Date'])
@@ -124,22 +201,75 @@ if __name__ == "__main__":
                 z.write("SO Does not Exist")
             continue
 
+        # Merge Daily_Output and Mold_End into main_move_df for this SO/prod code
         key_merge = pd.merge(df_export, main_move_df, how='inner', on='Prod_Code')
+
+        # Convert to datetime for filtering
+        key_merge['Mold_start_dt'] = pd.to_datetime(key_merge['Mold_start'])
+        key_merge['dStart_dt'] = pd.to_datetime(key_merge['dStart'])
+        key_merge['Mold_End_dt'] = pd.to_datetime(key_merge['Mold_End'])
+
+        # --- EXTENDED LOGIC: Expand Mold_End if quantity > sum of Mold up to max 30 days ---
+        # For each (SO, Prod_Code), adjust Mold_End if necessary
+        updated_mold_ends = {}
+        for idx, row in key_merge.iterrows():
+            so = row['SO']
+            prod_code = row['Prod_Code']
+            quantity = row['Quantity']
+            dstart = row['dStart_dt']
+            orig_mold_end = row['Mold_End_dt']
+            lot_num = row['Lot_Num']
+
+            # Only check if values are valid
+            if pd.isnull(dstart) or pd.isnull(orig_mold_end):
+                updated_mold_ends[(so, prod_code)] = orig_mold_end
+                continue
+
+            # We want to increase Mold_End one day at a time
+            # while sum of Mold < quantity, and maximum 30 days extension
+            curr_end = orig_mold_end
+            days_added = 0
+            key_merge_mold = key_merge[key_merge['Source']=='Mold']
+            while days_added < 30:
+                # Select lots in the date window
+                mask = (key_merge_mold['Prod_Code'] == prod_code) & \
+                       (key_merge_mold['Mold_start_dt'] >= dstart) & \
+                       (key_merge_mold['Mold_start_dt'] <= curr_end)
+                sum_mold = key_merge_mold.loc[mask][['Lot_Num','Qty']].drop_duplicates()['Qty'].sum()
+                if sum_mold >= quantity:
+                    break
+                # else, extend by 3 day
+                curr_end += pd.Timedelta(days=1)
+                days_added += 1
+            updated_mold_ends[(so, prod_code)] = curr_end
+
+        # Overwrite Mold_End_dt with the possibly extended value
+        key_merge['Mold_End_dt'] = key_merge.apply(
+            lambda row: updated_mold_ends.get((row['SO'], row['Prod_Code']), row['Mold_End_dt']),
+            axis=1
+        )
+
+        #code.interact(local=locals())
+        # Now use the extended Mold_End in list_filter
         list_filter = key_merge[
-            ((key_merge['Source'] == "Mold") &
-             (key_merge['Mold_start'] >= key_merge['dStart']))][['Prod_Code','Lot_Num']]
+            (key_merge['Mold_start_dt'] >= key_merge['dStart_dt']) &
+            (key_merge['Mold_start_dt'] <= key_merge['Mold_End_dt'])
+        ][['Prod_Code','Lot_Num']]
+
         list_filter['merged'] = list_filter['Lot_Num']+list_filter['Prod_Code']
         key_merge['merged'] = key_merge['Lot_Num']+key_merge['Prod_Code']
         key_merge = key_merge[key_merge['merged'].isin(list_filter['merged'])]
         filtered = key_merge[(key_merge['Date'] >= key_merge['dStart'])]
 
         # Pivot table for both reports
-        pivot_table = pd.pivot_table(filtered,
-                                    index=['PO','dEnd', 'Prod_Code', 'Quantity', 'Lot_Num', 'Mold_start'],
-                                    columns='Source',
-                                    values='Qty',
-                                    aggfunc='sum',
-                                    fill_value=0)
+        pivot_table = pd.pivot_table(
+            filtered,
+            index=['PO','dEnd', 'Prod_Code', 'Quantity', 'Lot_Num', 'Mold_start', 'Daily_Output'],
+            columns='Source',
+            values='Qty',
+            aggfunc='sum',
+            fill_value=0
+        )
         desired_order = ['Mold', 'Subcon', 'Receive', 'Count', 'QA', 'Pack', 'WHS']
         for col in desired_order:
             if col not in pivot_table.columns:
@@ -150,7 +280,7 @@ if __name__ == "__main__":
             lambda row: compute_rejects_row(row, desired_order), axis=1
         )
 
-        idx_cols = ['PO','dEnd', 'Prod_Code', 'Quantity', 'Lot_Num', 'Mold_start']
+        idx_cols = ['PO','dEnd', 'Prod_Code', 'Quantity', 'Lot_Num', 'Mold_start', 'Daily_Output']
         sum_cols = desired_order
 
         # Generate and save both reports
